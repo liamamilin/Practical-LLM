@@ -24,7 +24,7 @@ jobs:
           version: 1.10.18
       - uses: actions/configure-pages@v5
       - name: Render book
-        run: quarto render
+        run: quarto render --to html
       - uses: actions/upload-pages-artifact@v3
         with:
           path: _book
