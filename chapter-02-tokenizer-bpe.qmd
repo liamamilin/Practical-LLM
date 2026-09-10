@@ -1,0 +1,203 @@
+---
+title: "Tokenizer：文本如何变成数字（Tokenizer & BPE）"
+---
+
+## 本章要解决的问题
+
+第 1 章的脚本里有一行 `tokenizer(text, return_tensors="pt")`，我们把它当成黑盒用了。但有几个问题它没回答：
+
+- `max_new_tokens=100` 里的 token 到底是什么？和"字"是什么关系？
+- 为什么同一句话，中文 10 个字是 6 个 token，英文 26 个字母也是 6 个 token？为什么 API 对中文"更贵"？
+- `<|im_start|>` 这种特殊标记是从文本里切出来的吗？它怎么有一个固定编号？
+- 词表（vocabulary）大小 151643 这个数字是什么意思？
+
+本章把黑盒拆开：先手写一个 BPE（Byte Pair Encoding）分词器——现代 LLM 分词器的直系祖先——再用 HuggingFace 的工业级实现对照验证。读完你将能回答上面所有问题。
+
+## 环境要求
+
+```text
+Python 3.10+
+pip install transformers          # tokenizers 是它的依赖, 自动安装
+硬件: 任意, CPU 即可
+预计运行: 手写版 < 5 秒; 对照脚本 < 10 秒 (复用第 1 章下载的 Qwen tokenizer)
+```
+
+## 核心概念：为什么需要"子词"分词
+
+模型只认数字，所以文本必须先变成一串整数 id。问题是怎么切。三种流派：
+
+| 流派 | 做法 | 问题 |
+|---|---|---|
+| 字符级 | 每个字母/汉字一个 token | 序列太长，1 个汉字 = 3 个字节，上下文窗口浪费严重 |
+| 词级 | 每个单词一个 token | 词表爆炸（英语 50 万+ 词），遇到新词直接宕机（OOV 问题） |
+| **子词级** | 高频组合合并成一个 token，低频的拆开 | 两者的折中，现代 LLM 的标准做法 |
+
+子词（subword）的直觉：**常见的组合保持整体，罕见的组合拆成小块**。"语言模型"出现几十亿次 → 一个 token；"螭吻"几乎没见过 → 拆成字节。
+
+BPE 是最流行的子词算法，训练过程朴素得出奇：
+
+1. 把文本变成 UTF-8 字节序列（任何字符都只是 1–4 个字节，天然没有 OOV）
+2. 数一遍所有**相邻 token 对**的出现次数
+3. 把**最高频的那一对**合并成一个新 token，加入词表
+4. 回到第 2 步，重复直到词表达到目标大小
+
+合并次序就是分词规则：编码时按"先学的规则优先"把新文本切碎。理解了这四步，你就能理解 Qwen、GPT 系列所有 tokenizer 的内核。
+
+## 实现路径：手写 BPE
+
+实现只涉及三个函数 + 一个类，共约 100 行。逐块看：
+
+**块 1：统计与合并。** BPE 的两个原子操作：
+
+```python
+def get_pair_counts(ids):
+    counts = {}
+    for pair in zip(ids, ids[1:]):     # 相邻元素组成 pair
+        counts[pair] = counts.get(pair, 0) + 1
+    return counts
+
+def merge(ids, pair, new_id):
+    out, i = [], 0
+    while i < len(ids):
+        if i < len(ids) - 1 and (ids[i], ids[i+1]) == pair:
+            out.append(new_id); i += 2     # 命中: 两个 token 变一个
+        else:
+            out.append(ids[i]); i += 1
+    return out
+```
+
+**块 2：训练。** 重复"数频率 → 合并最高频对"直到词表达到目标大小：
+
+```python
+def train(self, text, vocab_size, verbose=False):
+    ids = list(text.encode("utf-8"))      # 起点: 256 种字节
+    for step in range(vocab_size - 256):  # 每轮学一条合并规则
+        counts = get_pair_counts(ids)
+        pair = max(counts, key=counts.get)  # 最高频的相邻对
+        new_id = 256 + step
+        ids = merge(ids, pair, new_id)
+        self.merges[pair] = new_id
+    # 构建 id -> bytes 解码表
+    self.vocab = {i: bytes([i]) for i in range(256)}
+    for (a, b), idx in self.merges.items():
+        self.vocab[idx] = self.vocab[a] + self.vocab[b]
+```
+
+**块 3：编码与解码。** 编码时按"合并规则的学习顺序"应用（早学的规则优先，保证训练和编码一致）：
+
+```python
+def encode(self, text):
+    ids = list(text.encode("utf-8"))
+    while len(ids) >= 2:
+        pairs = set(zip(ids, ids[1:]))
+        pair = min(pairs, key=lambda p: self.merges.get(p, float("inf")))
+        if pair not in self.merges:
+            break
+        ids = merge(ids, pair, self.merges[pair])
+    return ids
+
+def decode(self, ids):
+    return b"".join(self.vocab[i] for i in ids).decode("utf-8", errors="replace")
+```
+
+完整脚本见本章产物 `ch02_mini_bpe.py`，其中还包含一段小型中英混合训练语料。
+
+## 完整例子：训练 mini-BPE 并编码一句话
+
+```bash
+python ch02_mini_bpe.py
+```
+
+真实输出（词表目标 280，即学习 24 条合并规则）：
+
+```text
+merge   0: (101, 32) -> 256 (出现 80 次)      # 'e'+' ' —— 英语里最高频
+merge   1: (232, 175) -> 257 (出现 72 次)     # 中文"语"的 UTF-8 前两字节
+merge  11: (266, 139) -> 267 (出现 56 次)
+merge  12: (100, 101) -> 268 (出现 48 次)     # 'd'+'e'
+merge  19: (32, 116) -> 275 (出现 40 次)      # ' '+'t'
+...
+==================================================
+原文: '大语言模型学习语言。'
+token 数: 10 (UTF-8 字节数: 30)
+token 序列: [279, 267, 229, 173, 166, 228, 185, 160, 261, 270]
+解码还原: '大语言模型学习语言。'
+还原一致: True
+压缩率: 33.33%
+--------------------------------------------------
+每个 token 对应的字节串:
+  279 -> '大'
+  267 -> '语言模型'
+  229 -> b'\xe5'
+  173 -> b'\xad'
+  ...
+  261 -> '语言'
+  270 -> '。'
+```
+
+**怎么读这份输出：**
+
+1. **最高频合并是 `'e'+' '`**（80 次）——训练语料里英语的 "e " 最常见，BPE 找到的第一个模式完全是数据驱动的，没有任何语言规则。
+2. **"语言模型"合并成了一个 token**（id 267），"语言"也合并了（id 261）——这就是子词思想：高频组合保持整体。
+3. **"学习"没能合并**，留在字节级（`\xe5\xad\xa6` 三个字节占 3 个 token）——因为 24 条合并规则的额度被更高频的模式用完了。这正是词表大小（vocab size）的意义：**词表越大，常见词越可能整体保留，平均 token 数越少**，但 embedding 层参数也越多。
+4. **30 字节压到 10 个 token（33%）**，且 decode 完美还原——压缩和还原的可逆性是分词器的硬要求。
+
+## 完整例子 2：与工业级实现对照
+
+手写版词表太小、语料太少，切换到 HuggingFace 的 `tokenizers` 库（LLM 生态事实标准）和真实的 Qwen tokenizer 验证同一件事（`ch02_compare.py`）：
+
+```text
+HuggingFace BPE (同语料训练, 词表 280):
+  token 数: 3 -> ['大语言模型', '学习语言', '。']
+  解码还原: '大语言模型 学习语言 。'
+==================================================
+Qwen 词表大小: 151643 (我们的 mini-BPE 只有 280)
+  '大语言模型学习语言。'
+    字符 10 | 字节 30 | token 6
+  'The weather is nice today.'
+    字符 26 | 字节 26 | token 6
+  '我今天心情很好,想去公园散步。'
+    字符 15 | 字节 43 | token 9
+  特殊 token '<|im_start|>' -> id 151644
+  特殊 token '<|im_end|>' -> id 151645
+==================================================
+Qwen 切分 '大语言模型学习语言。' 的 token:
+  'å¤§'      # '大' 的 UTF-8 字节的"字节级表示"
+  'è¯Ńè¨Ģ'  # '语言'
+  'æ¨¡åŀĭ'  # '模型'
+  'åŃ¦ä¹ł'  # '学习'
+  'è¯Ńè¨Ģ'  # '语言'
+  'ãĢĤ'     # '。'
+```
+
+四个关键发现：
+
+1. **同原理，差在规模**。HF 的 BPE 在同样 280 词表下把"大语言模型"整体合并——它有更聪明的预切分和计数策略。Qwen 词表 15 万，是 mini-BPE 的 500 倍，所以任何常见中英文词都不需要拆。
+2. **Qwen 打印的 token 是乱码样**：这是字节级 BPE 的显示约定——字节用类 Latin-1 字符显示，实际 id 是正常的。不影响任何功能，但第一次看到会很困惑，现在你知道原因了。
+3. **中英文 token 效率差异有了精确解释**：中文一个汉字 3 字节、常被拆分，"我今天心情很好…"15 字符要 9 token；英文 26 字符只要 6 token。这就是按 token 计费时中文相对"贵"的原因，也是第 1 章 `max_new_tokens=100` 不等于 100 个字的原因。
+4. **特殊 token 是词表预留的固定编号**（151644、151645 排在 15 万词表的尾部），不从文本切分产生，任何文本都不可能被切成它们——这是对话模板机制的基石。
+
+## 边界与取舍
+
+- **手写版是教学简化**：真实 tokenizer 还有预切分（pre-tokenization，比如先把英文按空格/标点切开再合并，防止跨词合并出怪 token）、正则规则、训练加速等工程细节。理解了 merge 循环，这些都是在四个步骤上做增量。
+- **词表大小是取舍**：越大 → 序列越短、推理越快，但 embedding 参数越多（15 万词表 × 隐层维度 896 的 Qwen 仅此一项就上亿参数）、小语种越容易浪费词表名额。
+- **换 tokenizer = 换语言**：不同模型家族的 tokenizer 不通用，微调时必须用该模型自己的 tokenizer，混用会产生完全错乱的输入。
+- **不要用 mini-BPE 训练真实模型**：它是理解工具。但第 3、4 章的 mini-GPT 会继续用它对应的"字符级"简化版思路保持极简。
+
+## 本章产物
+
+1. **`ch02_mini_bpe.py`**：完整可运行的 BPE 实现（训练/编码/解码 + 逐 token 解读），100 行以内，零依赖
+2. **`ch02_compare.py`**：HF `tokenizers` + Qwen 真实分词器对照脚本
+3. **一套判断力**：能精确解释 token 数量、中文 token 开销、特殊 token 编号、词表大小的含义与取舍
+
+**概念—操作增量：**
+
+- **Concept 增量**：字符/词/子词三种分词流派；BPE 的合并循环；词表大小与 token 开销的取舍；特殊 token 的编号机制
+- **Operation 增量**：能从零训练一个 BPE 分词器并做 encode/decode；能用压缩率和 token 计数测算文本成本；能用 HF `tokenizers` 对照验证
+- **Judgment 增量**：词表越大序列越短但 embedding 参数越多；换模型必须换 tokenizer；中文 token 成本高的根因是 UTF-8 三字节 + 拆分
+
+## 小结：连接下一章
+
+现在文字已经变成了一串 token id，比如 `'大语言模型学习语言。'` → `[6 个 id]`。模型拿到这串整数后，第一件事是把每个 id 变成一个向量（embedding），然后交给 Transformer 处理。
+
+下一章我们进入全书最核心的一章：从 Self-Attention 的公式写起，逐块搭出一个完整的 Transformer，最后组装成 mini-GPT——把"那张看了无数遍的结构图"变成你亲手写的代码。

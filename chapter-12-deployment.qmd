@@ -1,0 +1,165 @@
+---
+title: "部署与推理优化：把模型用起来（Deployment & Inference Optimization）"
+---
+
+## 本章要解决的问题
+
+到此为止，你的微调产物是硬盘里的两个目录：`qwen_lora_adapter/`（几 MB 的适配器）和一堆 `.pt` 文件。它们离"能用"还差最后一公里：
+
+- 微调产物怎么变成一个**独立可分发**的模型？
+- 怎么让它在 Mac / 手机 / 显卡上都跑得快？——量化与推理引擎
+- 怎么包一个能分享的 Web 界面？
+
+本章完成全流程的闭环：**合并产物 → 量化推理 → Web 服务**，全部在你已经用过的模型上完成。
+
+## 环境要求
+
+```text
+Python 3.10+
+pip install torch transformers peft gradio llama-cpp-python
+需要: 第 6 章的 qwen_lora_adapter/, 第 1 章下载过的 Qwen2.5-0.5B
+GGUF 模型 (首次运行下载, 约 500MB):
+  huggingface-cli download Qwen/Qwen2.5-0.5B-Instruct-GGUF \
+      qwen2.5-0.5b-instruct-q8_0.gguf --local-dir ./gguf
+硬件: Mac 16GB 内存 (合并部分) / llama.cpp 部分只需 4GB
+预计运行: Mac 约 3-5 分钟
+```
+
+## 核心概念：部署栈的全景
+
+**推理引擎选型**（按硬件）：
+
+| 引擎 | 硬件 | 定位 |
+|---|---|---|
+| transformers + PyTorch | 任意 | 开发调试、原型；最慢 |
+| llama.cpp (GGUF) | Mac/CPU/手机/低端 GPU | 单机量化推理，Mac 原生 Metal 加速 |
+| vLLM | NVIDIA GPU | 高吞吐服务（连续批处理 + PagedAttention） |
+| Ollama / LM Studio | Mac 桌面 | 封装 llama.cpp 的开箱即用产品 |
+
+**量化（Quantization）的两条路线**：
+
+- **训练时**（第 7 章 QLoRA）：NF4 量化辅助训练；
+- **部署时**（本章）：把训练完的 float 模型压成 8-bit/4-bit 换速度和体积。格式主要是 **GGUF**（llama.cpp 生态的标准格式，一个文件包含权重 + 词表 + 配置）。0.5B 模型的体积对照：fp32 约 2GB → Q8 约 0.5GB → Q4 约 0.4GB。
+
+**KV 缓存（KV Cache）**：自回归生成时，已生成 token 的 Key/Value 可以缓存复用，每生成一个 token 只需算一次前向——这是所有推理引擎的标配优化，也是"上下文越长、首 token 越慢"的原因。
+
+**合并（Merge）**：第 6 章说过，LoRA 适配器可以合并回底座（`merge_and_unload()`），得到零推理开销的独立模型。发布场景选合并；多风格切换场景保留适配器。
+
+## 实现路径：三步上线
+
+### 第 1 步：llama.cpp 量化推理
+
+下载官方 GGUF 后，用 Python 绑定直接对话：
+
+```python
+from llama_cpp import Llama
+
+llm = Llama(model_path="qwen2.5-0.5b-instruct-q8_0.gguf", n_ctx=2048)
+out = llm.create_chat_completion(
+    messages=[{"role": "user", "content": "用一句话解释什么是量化。"}],
+    max_tokens=80, temperature=0.7)
+```
+
+### 第 2 步：合并 LoRA 产物
+
+```python
+from peft import PeftModel
+
+base = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+merged = PeftModel.from_pretrained(base, "qwen_lora_adapter")
+merged = merged.merge_and_unload()      # 增量加回原权重
+merged.save_pretrained("qwen_merged")   # 约 2GB, 可独立分发的完整模型
+```
+
+### 第 3 步：Gradio Web 界面
+
+```python
+import gradio as gr
+
+def respond(message, history):
+    return chat(message, max_new_tokens=100)
+
+demo = gr.ChatInterface(fn=respond, title="我的微调模型")
+demo.launch()          # 本地: http://127.0.0.1:7860
+                       # 公网分享: demo.launch(share=True) 生成临时链接
+```
+
+## 完整例子
+
+完整脚本 `ch12_deploy.py`，真实输出（Mac / MPS 实测）：
+
+```text
+第 1 部分: llama.cpp 量化推理
+  回答: '量化是一种数据处理和分析方法，通过计算和分析数据的数值特征和规律，以实现对数据的深入理解和预测。'
+  速度: 218 tokens/s | 模型占用 ~0.5GB (Q8 量化)
+============================================================
+第 2 部分: 合并 LoRA 适配器
+  合并完成 -> qwen_merged/ (约 2GB, 可独立分发)
+  合并后行为检查:
+    Q: 法国的首都是哪里 -> '【答案】巴黎'
+    Q: 12+13等于多少    -> '【答案】25'
+    Q: 埃及的首都是哪里 -> '【答案】开罗'    # 没见过的题, 格式依旧
+第 3 部分: Gradio Web Demo
+启动 Web 界面: http://127.0.0.1:7860      (HTTP 200, 界面正常)
+```
+
+## 结果解读与两个真实踩到的坑
+
+**坑 1：合并后行为"消失"。** 本章开发时真实发生过：合并后测试，模型回答"巴黎，简称'法'……"——微调的"【答案】"格式不见了。排查后发现适配器本身完好（单独加载行为正常），问题出在**部署侧的 prompt 与训练侧不一致**：训练时对话里有 system 消息（"你是一个乐于助人的中文助手。"），部署函数里没带。加上之后格式立刻恢复。
+
+这是微调部署**最常见的事故**，教训写成规则：**部署 prompt（system 消息、模板、特殊 token）必须与训练侧逐字一致**。建议把训练时的 prompt 组装代码直接复用到部署代码里，而不是重写一遍。
+
+**坑 2：量化文件的路径管理。** GGUF 文件几百 MB 到几十 GB，别放在 pip 缓存或系统盘。约定一个模型目录（如 `~/models/`），配合 `huggingface-cli download` 的 `--local-dir` 使用。
+
+**速度数字的意义**：218 tokens/s 是 Mac（Metal 加速 + Q8 量化）跑 0.5B 模型的水平——已经远超阅读速度（约 5–10 字/秒）。参照系：7B Q4 模型在 M 系列芯片上约 15–30 tokens/s；GPU + vLLM 服务 7B 可达数千 tokens/s 的总吞吐（多请求并发）。**选型的本质是"延迟敏感"还是"吞吐敏感"**：聊天看延迟（llama.cpp/本地），API 服务看吞吐（vLLM）。
+
+**vLLM 补充（GPU 路线）**：Mac 上不可用，但值得知道它的样子——
+
+```python
+# 需要 NVIDIA GPU; 建议在 AutoDL 实例上运行
+from vllm import LLM, SamplingParams
+llm = LLM(model="qwen_merged")          # 也可直接指向 HF 仓库名
+out = llm.generate(["法国的首都是哪里"],
+                   SamplingParams(temperature=0.7, max_tokens=50))
+```
+
+vLLM 的核心是连续批处理（continuous batching）：新请求随时插入正在生成的批次，GPU 利用率远高于逐请求推理。它是所有开源推理服务的默认后端。
+
+## 边界与取舍
+
+- **合并 vs 保留适配器**：合并后的模型体积 = 完整底座（2GB），且不能再换"人格"；保留适配器则可以一个底座挂 N 个适配器（每个几 MB），但推理时多一次旁路计算。**产品发布选合并，实验迭代选适配器。**
+- **量化等级的选择**：Q8 几乎无损（本章用法）；Q4 体积再省一半，通用任务质量损失可接受，但小模型 + Q4 的组合可能出现明显劣化——**量化后必须重新过一遍评估集**（第 10 章的脚本直接复用）。
+- **Gradio 的定位**：快速演示与内部工具，不适合高并发生产。生产部署是 FastAPI + 队列 + 推理引擎（vLLM 自带 OpenAI 兼容 API：`vllm serve qwen_merged`，一行命令得到标准 API）。
+- **安全底线**：公开服务务必加输入长度限制、输出内容审核和访问控制——微调模型会忠实放大训练数据里的任何问题行为。
+
+## 本章产物
+
+1. **`ch12_deploy.py`**：量化推理（llama.cpp）→ 合并（PEFT）→ Web 界面（Gradio）三合一脚本
+2. **`qwen_merged/`**：可独立分发的完整微调模型
+3. **部署选型表**：llama.cpp（Mac/边缘）/ vLLM（GPU 服务）/ Gradio（演示）/ FastAPI+vLLM serve（生产）
+4. **一条部署铁律**：部署 prompt 与训练 prompt 逐字一致
+
+**概念—操作增量：**
+
+- **Concept 增量**：部署栈全景（llama.cpp/vLLM/Ollama 的定位）；GGUF 格式；KV Cache 与上下文长度的关系；合并 vs 保留适配器的取舍
+- **Operation 增量**：能用 llama.cpp 跑量化推理并测速；能执行 merge_and_unload 得到独立模型；能用 Gradio 包一个可分享的界面
+- **Judgment 增量**：部署 prompt 必须与训练 prompt 逐字一致（最常见事故）；聊天看延迟选 llama.cpp、API 服务看吞吐选 vLLM；量化后必须重过评估集
+
+## 小结：全书闭环
+
+到这里，第 1 章"四阶段流水线"的每一格都填上了你亲手跑过的实验：
+
+```text
+预训练 (第 3-4 章, mini-GPT 从噪声到会说话)
+  → SFT (第 5 章, 从续写到回答)
+  → LoRA/QLoRA (第 6-7 章, 从 Mac 到 7B 云 GPU)
+  → DPO 对齐 (第 8 章, 学会"偏好")
+  → 数据工程 (第 9 章) + 评估 (第 10 章) 贯穿全程
+  → 多模态 (第 11 章) 与部署 (本章) 完成落地
+```
+
+接下来可以做的三件事：
+
+1. **换数据重跑**：把第 5–8 章的流程套在你自己感兴趣的领域数据上（客服、文档、角色扮演），体会"数据决定行为"。
+2. **上真 GPU**：按第 7 章流程租几小时 4090，微调一个 7B 模型，对比 0.5B 的能力差异。
+3. **读源码**：带着本书的手写经验去读 transformers/trl/llama.cpp 的源码——你已经认识里面的每一个概念。

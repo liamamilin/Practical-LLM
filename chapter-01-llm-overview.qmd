@@ -1,0 +1,269 @@
+---
+title: "大模型全景（LLM Overview）"
+---
+
+## 本章要解决的问题
+
+你一定见过这些词：预训练、SFT、LoRA、RLHF、量化部署。它们在文章里反复出现，但很少有人把它们**按顺序**讲清楚：一个从零开始的模型，到底先经过什么、再经过什么，最后变成你手里那个能对话的产品？
+
+本章回答三个问题：
+
+1. 大语言模型（Large Language Model, LLM）的本质是什么？
+2. 一个 LLM 从"一堆随机参数"到"能听话的助手"要经过哪几个阶段？
+3. 全书的 12 章分别在这条流水线的哪个位置？
+
+读完本章，你会亲手运行第一个 LLM 推理程序，并且能自己画出这条训练流水线。
+
+## 环境要求
+
+```text
+Python 3.10+
+pip install torch transformers    # Mac CPU 即可
+模型下载：约 1 GB（Qwen2.5-0.5B-Instruct，首次运行自动下载）
+预计运行时间：安装 5 分钟，推理示例 < 1 分钟
+硬件：无特殊要求，8GB 内存即可
+```
+
+## 核心概念：LLM 的本质是一个"下一个词"预测器
+
+先说结论，再展开。
+
+**LLM 的本质是一个超大型的"文本接龙"函数**：输入一段文字（一串 token），输出下一个 token 的概率分布。仅此而已。GPT 的全称 Generative Pre-trained Transformer——"生成式"说的就是这种逐词接龙的生成方式。
+
+理解这个本质，很多现象就自然通了：
+
+- 为什么模型会"幻觉"？因为它在续写，续写的内容看起来合理但可能不真实——就像一个擅长编故事的人。
+- 为什么预训练模型（base 模型）不会好好回答问题？因为"回答问题"不是续写行为的必然结果，续写只保证"像训练数据里的文字"。
+- 为什么上下文有长度限制？因为模型一次只能看到固定窗口内的 token。
+
+一个最小的例子（伪代码）：
+
+```python
+next_token_probs = model(["今天天气"])   # 输出：词表中每个 token 的概率
+# "真"  0.62
+# "不错" 0.11
+# "..."  ...
+```
+
+模型生成一段话，就是把"预测下一个 token → 拼接到输入 → 再预测下一个"循环几十上百次。所以整个 LLM 世界，无论表面多复杂，内核都是这一个函数。
+
+## 系统结构：四阶段训练流水线
+
+一个能用的 LLM，要经过四个阶段。这是全书的主线地图：
+
+```{mermaid}
+flowchart LR
+    A["1. 预训练<br/>海量文本<br/>学'接龙'"] --> B["2. SFT 指令微调<br/>几万条指令数据<br/>学'听话'"]
+    B --> C["3. 偏好对齐<br/>人类偏好数据<br/>学'回答得好'"]
+    C --> D["4. 部署<br/>量化加速<br/>学着'跑得快'"]
+```
+
+### 阶段 1：预训练（Pretraining）——学会"说话"
+
+把互联网规模的文本（数万亿 token）喂给模型，唯一的任务是：**预测下一个 token**。
+
+- 数据：网页、书籍、代码、百科
+- 规模：千亿级 token，数周至数月，数千块 GPU
+- 产物：base 模型——知识渊博的"续写机器"，但不会对话
+
+为什么这一个简单任务能学出智能？因为要预测下一个词，模型必须隐式学会语法、事实知识、甚至推理。预测是手段，压缩世界是结果。
+
+### 阶段 2：SFT 指令微调（Supervised Fine-Tuning）——学会"听话"
+
+base 模型只会续写，不会"你问它答"。SFT 用几万到几百万条**人工标注的指令-回答对**继续训练：
+
+```text
+用户：把这句话翻译成英文：今天天气不错
+助手：The weather is nice today.
+```
+
+- 数据：高质量问答对（这个数据从哪来、怎么造，是第 9 章的主题）
+- 规模：相对预训练小得多（数据量 0.1% 以下，算力 1% 以下）
+- 产物：instruct 模型——能按指令行事了
+
+### 阶段 3：偏好对齐（Alignment）——学会"回答得好"
+
+能回答，不等于回答得好。对齐阶段用**人类偏好数据**（同一问题两个回答，人标出哪个更好）让模型拟合人类的判断标准。主流方法：
+
+- RLHF（Reinforcement Learning from Human Feedback）：训练奖励模型 + PPO 强化学习，工业界常用但工程复杂
+- DPO（Direct Preference Optimization）：绕开奖励模型，直接用偏好对微调，简单稳定，社区首选
+
+本书第 8 章讲 DPO，RLHF 只做概念铺垫。
+
+### 阶段 4：部署——学会"跑得快"
+
+训练好的模型是几十 GB 的权重文件，要变成产品还差一步：
+
+- **量化（Quantization）**：把 16 位精度压到 8 位、4 位，体积和显存需求降一个数量级
+- **高效推理**：vLLM、llama.cpp 等框架提升吞吐
+- **服务化**：包一层 API 或 Web 界面
+
+这就是第 12 章的内容。
+
+### 一张表看完全流程
+
+| 阶段 | 数据 | 数据规模 | 学到什么 | 类比 |
+|---|---|---|---|---|
+| 预训练 | 原始文本 | 万亿 token | 语言+世界知识 | 读完全世界图书馆 |
+| SFT | 指令-回答对 | 10万+ 条 | 听懂指令 | 上岗培训 |
+| 对齐 | 偏好对 | 10万+ 条 | 回答得符合人的口味 | 绩效反馈 |
+| 部署 | 无 | — | — | 持证上岗 |
+
+注意一个反直觉的事实：**模型 99% 的"知识"来自预训练，SFT 和对齐主要改变的是行为方式**。这也是为什么微调几百条数据就能显著改变模型行为——你不需要教它知识，只需要教它"怎么用已有的知识回应你"。
+
+## 实现路径：跑通你的第一个 LLM
+
+第 4 阶段往后推，我们从"推理"这个最轻的环节入手。下面的脚本加载一个 5 亿参数的小模型（Qwen2.5-0.5B-Instruct），完成一次对话式生成。
+
+分三步理解：
+
+**第 1 步：加载 tokenizer 和模型。** tokenizer（分词器）负责文字 ↔ token 的转换，模型负责概率计算。这是第 2 章的主题。
+
+**第 2 步：组装对话。** 用对话模板（chat template）把你的问题包成模型认识的格式。
+
+**第 3 步：循环生成。** 模型逐 token 接龙，直到生成结束符。
+
+## 完整例子：hello_llm.py
+
+```python
+# ch01_hello_llm.py
+# 环境要求: pip install torch transformers
+# 硬件: CPU 即可 (Mac 建议), 模型约 1GB 首次自动下载
+# 预计运行: CPU 上 ~10 秒
+
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+# 自动检测设备: 有 NVIDIA GPU 用 cuda, Mac 用 mps, 否则 cpu
+if torch.cuda.is_available():
+    device = "cuda"
+elif torch.backends.mps.is_available():
+    device = "mps"
+else:
+    device = "cpu"
+print(f"使用设备: {device}")
+
+model_name = "Qwen/Qwen2.5-0.5B-Instruct"
+
+# 第 1 步: 加载 tokenizer 和模型
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    dtype=torch.float32,         # Mac 的 mps 对 float16 支持不全, 保险起见用 float32
+)
+model = model.to(device)
+model.eval()  # 推理模式, 关闭 dropout 等
+
+# 第 2 步: 组装对话
+messages = [
+    {"role": "user", "content": "用一句话解释什么是大语言模型。"}
+]
+text = tokenizer.apply_chat_template(
+    messages, tokenize=False, add_generation_prompt=True
+)
+print("-" * 40)
+print("送入模型的原始文本:")
+print(text)
+
+# 第 3 步: 生成
+inputs = tokenizer(text, return_tensors="pt").to(device)
+with torch.no_grad():
+    output_ids = model.generate(
+        **inputs,
+        max_new_tokens=100,   # 最多生成 100 个新 token
+        do_sample=True,       # 按概率采样而非取最大值, 生成更自然
+        temperature=0.7,      # 温度越低越确定, 越高越发散
+        top_p=0.9,            # 只从累计概率前 90% 的 token 中采样
+    )
+
+# 截掉输入部分, 只取新生成的 token, 解码为文字
+new_tokens = output_ids[0][inputs["input_ids"].shape[1]:]
+answer = tokenizer.decode(new_tokens, skip_special_tokens=True)
+print("-" * 40)
+print("模型回答:")
+print(answer)
+
+# 顺手验证 "下一个词预测器" 的本质: 看看模型认为下一个最可能的词
+next_step = model(**inputs)
+probs = torch.softmax(next_step.logits[0, -1], dim=-1)
+top5 = torch.topk(probs, 5)
+print("-" * 40)
+print("模型眼中, 对话的下一个 token 概率 top5:")
+for idx, p in zip(top5.indices, top5.values):
+    print(f"  {tokenizer.decode([idx])!r}: {p:.4f}")
+```
+
+运行：
+
+```bash
+python ch01_hello_llm.py
+```
+
+## 结果解读
+
+典型输出（Mac M 系列 / MPS 实测，采样导致回答每次略不同）：
+
+```text
+使用设备: mps
+----------------------------------------
+送入模型的原始文本:
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+用一句话解释什么是大语言模型。<|im_end|>
+<|im_start|>assistant
+
+----------------------------------------
+模型回答:
+大语言模型是一种计算机程序或算法，能够模仿人类的自然语言处理能力，
+进行理解和生成人类所使用的自然语言。它们通常用于各种应用场景，
+如智能客服、自动化写作、语音识别等。
+----------------------------------------
+模型眼中, 对话的下一个 token 概率 top5:
+  '大': 0.9754
+  '"': 0.0057
+  '“': 0.0028
+  '所谓': 0.0019
+  '大型': 0.0019
+```
+
+三个值得注意的观察：
+
+1. **对话模板的痕迹**：送入模型的不是你的一句话，而是带 `<|im_start|>` 标记的格式化文本。注意模板还自动插入了一段英文 system prompt（`You are Qwen...`）——我们没写它，`apply_chat_template` 按 Qwen 的约定自动加上的。这些特殊 token 告诉模型"这是用户说的、现在该你说了"。SFT 之所以能让 base 模型听话，本质上就是教会了模型识别这些标记并按格式回应——第 5 章会亲手构造这个过程。
+2. **回答是逐 token 生成的**：`max_new_tokens=100` 不是 100 个字。中文一个字通常是 1–2 个 token，这也解释了为什么各 API 按 token 计费。
+3. **top5 概率印证了"接龙"本质**：模型此刻正在算"该说哪个字"的概率分布，"大"（语言模型）以最高概率胜出。每一次生成都重复这个过程。
+
+如果 `do_sample=False`（贪心模式），模型每次都选概率最高的 token——回答固定但容易呆板重复。采样的随机性来自 `temperature` 和 `top_p`，第 4 章会展开这对参数的数学含义。
+
+## 边界与取舍
+
+**0.5B 模型能力有限。** 你可能会遇到它答错、答偏、中英夹杂。这不是 bug——5 亿参数的模型就是"小型犬"，聪明但记性差。它的价值在于**把完整流程跑通**。全书前 8 章的微调实验都基于这个量级或更小的模型；等到第 7 章 QLoRA，你会在云 GPU 上微调 7B 模型，体验"大型犬"的差别。
+
+**下载不动的替代方案。** 如果网络下载 HuggingFace 模型困难，设置国内镜像后重试：
+
+```bash
+export HF_ENDPOINT=https://hf-mirror.com
+```
+
+**不要跳过本章代码直接看后面。** 这个脚本里的每个对象（tokenizer、model、generate）在后续 11 章反复出现，它们是全书唯一不变的基础设施。
+
+## 本章产物
+
+读完本章，你拿到了：
+
+1. **一张流程图**：预训练 → SFT → 对齐 → 部署，四阶段、各自的数据和产物
+2. **一个判断框架**："模型 99% 的知识来自预训练，微调改变行为"——这个框架将指导你后面所有微调决策
+3. **一个可运行脚本** `ch01_hello_llm.py`：包含全书通用的设备检测逻辑和推理三步式
+4. **一组核心词汇**：token、tokenizer、chat template、temperature/top_p、base/instruct 模型
+
+**概念—操作增量：**
+
+- **Concept 增量**：LLM 四阶段流水线（预训练→SFT→对齐→部署）；token；base 与 instruct 模型的区别；temperature/top_p
+- **Operation 增量**：能加载任意 HF 模型完成一次对话推理；能查看 next-token 概率分布；能调整采样参数观察行为变化
+- **Judgment 增量**：模型 99% 的知识来自预训练、微调只改行为——这是判断"微调能否解决你的问题"的第一规则
+
+## 小结：连接下一章
+
+你刚才调用了 `tokenizer` 把文字变成数字，但其中发生的事情被封装起来了：一句话到底切成了几个 token？`<|im_start|>` 是一个 token 还是四个？为什么中文比英文费 token？
+
+下一章，我们亲手把 tokenizer 拆开——从零实现一个 BPE（Byte Pair Encoding）分词器，亲眼看到文字变成数字的全过程。

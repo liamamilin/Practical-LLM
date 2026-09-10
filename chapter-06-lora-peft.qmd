@@ -1,0 +1,200 @@
+---
+title: "参数高效微调：手写 LoRA 与 PEFT 实战（LoRA & PEFT）"
+---
+
+## 本章要解决的问题
+
+第 5 章我们对 14 万参数的 mini-GPT 做了全参数微调，每个权重都在更新。把同样的操作放大到真实模型，先算一笔账：
+
+训练时每个参数要存 4 份东西——权重本身、梯度、Adam 优化器的一阶/二阶动量。以 float32 计，1 个参数约 16 字节：
+
+| 模型 | 全参数微调显存 | 消费级硬件 |
+|---|---|---|
+| mini-GPT（0.14M） | 约 2MB | 随便跑 |
+| Qwen-0.5B | 约 8GB | Mac 16GB 勉强 |
+| Qwen-7B | 约 112GB | 不可行 |
+| Qwen-72B | 约 1.2TB | 数据中心起步 |
+
+**LoRA（Low-Rank Adaptation，低秩适配）用一个极简的想法绕开这笔账：冻结全部原权重，在需要微调的线性层旁边加一条窄窄的"旁路"，只训练旁路。** 本章先手写 LoRA 的核心逻辑（40 行以内），再用 HuggingFace PEFT 在 0.5B 真实模型上复现同一实验。
+
+## 环境要求
+
+```text
+Python 3.10+
+pip install torch transformers peft accelerate
+硬件: 手写版任意; PEFT 版 Mac 8GB 内存即可 (MPS), GPU 更快
+预计运行: 手写版 ~10 秒; PEFT 版 Mac(MPS) 约 3-5 分钟
+```
+
+## 核心概念：为什么"低秩"就够了
+
+微调前后的权重变化 $\Delta W = W_{new} - W_0$ 通常是**高度冗余**的——它可以用两个瘦矩阵的乘积近似：
+
+$$\Delta W \approx B \cdot A, \quad A \in \mathbb{R}^{r \times d_{in}}, \ B \in \mathbb{R}^{d_{out} \times r}, \ r \ll \min(d_{in}, d_{out})$$
+
+原本 $d_{in} \times d_{out}$ 的更新矩阵，现在只需要 $r \times (d_{in} + d_{out})$ 个参数。$r$ 叫**秩（rank）**，典型值 4–64，是 LoRA 最重要的超参——它就是"微调容量"的旋钮。
+
+前向传播变成：
+
+```text
+输出 = W0 @ x + (alpha/r) * B @ (A @ x)
+       ───冻结───   ───────可训练旁路───────
+```
+
+三个关键设计：
+
+1. **A 用随机小值初始化，B 用全零初始化** → 训练开始时旁路输出为 0，模型行为与原模型完全一致，然后逐渐学出增量。初始化不对称是必须的（两边都零则梯度为死）。
+2. **alpha（缩放因子）**：实际增量为 `(alpha/r) · B@A@x`。调大 r 时保持 alpha/r 不变，等效学习率才稳定。
+3. **target_modules**：挂到哪些层。注意力层的 Q/K/V 投影是最常用选择，容量不够再加 FFN。
+
+微调结束后有两个产物选项：**合并**（把 $\Delta W$ 加回 $W_0$，推理零开销）或**保留适配器**（几 MB 的小文件，可在同一底座上切换多套"人格"）。
+
+## 实现路径 A：手写 LoRA（40 行核心）
+
+```python
+class LoRALinear(nn.Module):
+    """在冻结的原线性层旁边加低秩旁路"""
+
+    def __init__(self, base: nn.Linear, r=8, alpha=16):
+        super().__init__()
+        self.base = base
+        d_out, d_in = base.weight.shape
+        self.lora_A = nn.Parameter(torch.randn(r, d_in) * 0.01)  # 随机小值
+        self.lora_B = nn.Parameter(torch.zeros(d_out, r))        # 全零
+        self.scaling = alpha / r
+
+    def forward(self, x):
+        return self.base(x) + self.scaling * (x @ self.lora_A.T @ self.lora_B.T)
+
+
+def apply_lora(model, target_names, r=8, alpha=16):
+    """把名字命中的 Linear 替换成 LoRALinear"""
+    for name, module in model.named_modules():
+        for child_name, child in list(module.named_children()):
+            if child_name in target_names and isinstance(child, nn.Linear):
+                setattr(module, child_name, LoRALinear(child, r, alpha))
+```
+
+训练侧只改三行：冻结所有原参数 → 解冻 `lora_A/lora_B` → 优化器只收可训练参数：
+
+```python
+for p in model.parameters():
+    p.requires_grad = False
+for m in model.modules():
+    if isinstance(m, LoRALinear):
+        m.lora_A.requires_grad = True
+        m.lora_B.requires_grad = True
+```
+
+然后把第 5 章的 SFT 原样搬过来（同一份数据、同一个掩码损失），但优化器只更新旁路。
+
+## 完整例子 A：mini-GPT 上的手写 LoRA
+
+脚本 `ch06_lora_manual.py`，真实输出（Mac / MPS）：
+
+```text
+替换了 8 个线性层
+总参数: 0.15M | 可训练: 16.4K (10.68%)
+step   0 | sft loss 9.511
+step 300 | sft loss 1.899
+step 900 | sft loss 1.312
+LoRA 增量已保存: mini_gpt_lora.pt (16.4K 参数)
+==================================================
+'Q: 法国的首都是哪里\nA:'  -> '...A: 巴黎\n'
+'Q: 3+5等于多少\nA:'       -> '...A: 8\n'
+'Q: 2+9等于多少\nA:'       -> '...A: 13\n'      # 正确是 12, 差一点
+'Q: 韩国的首都是哪里\nA:'   -> '...A: 首尔\n'
+```
+
+**对比第 5 章全参数微调（loss 0.34，全部答对），LoRA 的取舍清晰可见。** 而且这个结果本身就是两次实验换来的：最初版本只挂注意力层（r=4，可训练 2.0K/1.47%），loss 卡在 2.9，首都题输出乱码、算术题答非所问——**旁路容量不够**。把 r 提到 8、把 FFN 层也挂上（16.4K/10.68%）后才学会大部分任务，但 2+9 还是差一点。
+
+由此得到 LoRA 实战的第一组判断力：
+
+| 现象 | 诊断 | 处理 |
+|---|---|---|
+| 训练 loss 降不下去 | 容量不足（r 太小 / 挂的层太少） | 加大 r，扩 target_modules |
+| 训练 loss 低但新题仍错 | 正常——LoRA 与泛化无关（见第 5 章） | 换数据策略，不是调 r |
+| loss 不动 | 学习率太小（旁路从零开始） | LoRA 学习率可比全参微调大 5–10 倍 |
+
+## 实现路径 B：HuggingFace PEFT 实战
+
+PEFT 库把上面手写的一切封装成两行。在 Qwen2.5-0.5B-Instruct 上做同样的实验——教模型养成"【答案】X"的固定应答格式（**只靠示例，不靠指令**，system prompt 保持普通）：
+
+```python
+from peft import LoraConfig, get_peft_model
+
+lora_config = LoraConfig(
+    r=8, lora_alpha=16, lora_dropout=0.05,
+    target_modules=["q_proj", "k_proj", "v_proj"],
+    task_type="CAUSAL_LM",
+)
+model = get_peft_model(model, lora_config)
+model.print_trainable_parameters()
+```
+
+数据编码用 chat template，并用 `-100` 掩码实现"只对答案算 loss"——这就是第 5 章手写掩码的官方等价物：
+
+```python
+labels[i, :prompt_len] = -100    # 提问部分不计算 loss
+```
+
+训练 40 步（MPS 上几分钟），保存适配器：
+
+```python
+model.save_pretrained("qwen_lora_adapter")   # 只保存 LoRA 增量
+```
+
+## 完整例子 B：0.5B 模型的真实微调
+
+脚本 `ch06_lora_peft.py`，真实输出（Mac / MPS）：
+
+```text
+trainable params: 737,280 || all params: 494,770,048 || trainable%: 0.1490
+step  0 | loss 2.7779
+step 10 | loss 0.9125
+step 20 | loss 0.0857
+step 30 | loss 0.0172
+LoRA 适配器已保存: qwen_lora_adapter/
+==================================================
+Q: 中国的首都是哪里  (期望: 北京)
+  模型: '【答案】北京'
+Q: 埃及的首都是哪里  (期望: 开罗)          # 未参与训练
+  模型: '【答案】开罗'
+Q: 12+13等于多少  (期望: 25)              # 未参与训练
+  模型: '【答案】25'
+```
+
+微调前，同一个模型对同样的问题回答 `'中国的首都是北京。'`、`'12 + 13 = 25'`——正常但自由发挥；40 步、0.149% 的参数之后，所有回答（包括没见过的题）都严格套用"【答案】"格式。
+
+**三个与 mini-GPT 实验的关键差异，都指向"规模"：**
+
+1. **可训练占比降到 0.149%**（vs 手写版的 10.68%）——真实模型只需极小的旁路就能承载行为改变，因为底座里已有丰富的中间表征，LoRA 只需"重新路由"它们。
+2. **没见过的题也对**——0.5B 底座本来就知道"埃及→开罗"（预训练灌进去的知识），LoRA 只教会它"该用什么格式输出"。对照第 5 章 mini 模型在没见过的题上全错的情形：**格式靠微调，事实靠预训练**，这条分界线在第 5 章埋下，在这里得到实证。
+3. **40 步就收敛**——行为适配是很浅的改动，不需要长训练。过久反而会把预训练能力磨坏（灾难性遗忘）。
+
+## 边界与取舍
+
+- **r 怎么选**：行为/风格类微调 r=8 起步足够；领域适配（术语密集）r=16–32；复杂推理风格 r=64+。内存允许时宁大勿小，反正参数占比仍然很小。
+- **lr 怎么选**：LoRA 的可训练参数从零开始，学习率通常取全参数微调的 5–10 倍（本章 1e-4，全参微调常用 1e-5 ~ 2e-5）。
+- **手写版与 PEFT 的差异**：PEFT 还支持 dropout、bias 微调、多种 PEFT 方法（Prefix Tuning、IA3 等）；手写版让你看清"替换线性层 + 冻结 + 旁路"的骨架。**面试或排查问题时，脑子里要能随时展开这个骨架。**
+- **保存的到底是什么**：`qwen_lora_adapter/` 只有几 MB（737K 参数），完整模型 2GB。这组数字就是"参数高效"四个字的直接度量。多个适配器可以共用一个底座——加载时指定 `adapter_name` 即可切换。
+- **合并（merge）的时机**：要发布独立模型时 `merge_and_unload()`，推理无额外开销；要快速迭代/多风格切换时保留适配器。
+
+## 本章产物
+
+1. **`ch06_lora_manual.py`**：LoRA 核心实现（LoRALinear 类 + apply_lora + 冻结训练），40 行核心逻辑
+2. **`ch06_lora_peft.py`**：PEFT 标准工作流（LoraConfig → get_peft_model → -100 掩码 → save_pretrained）
+3. **`qwen_lora_adapter/`**：0.5B 模型的真实 LoRA 适配器——你的第一个可分发微调产物
+4. **三组对照判断力**：容量旋钮（r/target_modules）的行为、格式 vs 事实的分界、LoRA 学习率的特殊性
+
+**概念—操作增量：**
+
+- **Concept 增量**：全参微调的 16 字节/参数显存账；LoRA 的低秩假设与 B 零初始化；r/alpha/target_modules 三个旋钮；合并与适配器两种产物形态
+- **Operation 增量**：能手写 LoRA 层并挂载到任意线性层；会用 PEFT 两行挂载、保存/加载适配器；会做显存估算
+- **Judgment 增量**：r 是容量旋钮（loss 降不动 → 加 r 扩层）；LoRA 学习率可比全参大 5-10 倍；格式靠微调、事实靠预训练（0.5B 实证）
+
+## 小结：连接下一章
+
+LoRA 解决了"训多少参数"的问题，但 0.5B 模型我们仍然用 float32 存了全部权重（2GB）。想让 7B 模型在 24GB 消费级显卡上微调，还差最后一招：**把冻结的底座压到 4-bit**。QLoRA = 4-bit 量化底座 + LoRA 旁路，显存直降一个数量级。
+
+下一章我们会租一台真实的云 GPU（AutoDL，每小时约两元），在 7B 模型上跑一次真正的 QLoRA——包括租用、SSH、传数据、训练、取回模型的完整流程。Mac 用户也有对照方案。

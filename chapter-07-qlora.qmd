@@ -1,0 +1,161 @@
+---
+title: "QLoRA 与显存优化：在消费级硬件微调 7B（QLoRA & Memory Optimization）"
+---
+
+## 本章要解决的问题
+
+第 6 章的 LoRA 把"训多少参数"压到了 0.1%，但底座本身还是全精度躺在显存里。算一笔账：Qwen2.5-7B 用 bf16 加载需要 14GB；加上梯度、激活和 737K 以上的 LoRA 训练开销，16GB 显存的显卡刚好卡在生死线上，而 Mac 的 MPS 甚至无法运行本章的主角——bitsandbytes 的 4-bit 量化训练。
+
+**QLoRA（Quantized LoRA）**给出最后一击：**把冻结的底座压到 4-bit 存储、计算时反量化到 bf16，LoRA 旁路保持 16-bit 训练**。7B 模型的底座从 14GB 压到约 4GB，24GB 显存绰绰有余，甚至 12GB 的游戏本显卡也能微调 7B。
+
+本章的另一半是**实操**：微调 7B 模型需要真 GPU，本章给出从零租用云 GPU（以 AutoDL 为例，约 ¥1.6/小时）的完整流程——选卡、SSH、传文件、tmux 训练、取回模型。你不需要长期持有显卡，按小时付费即可。
+
+## 环境要求
+
+```text
+主路线 (GPU): 任何 >= 16GB 显存的 NVIDIA 卡; AutoDL RTX 4080/4090 约 ¥1.5-2/小时
+依赖: pip install torch transformers peft accelerate bitsandbytes datasets
+模型: Qwen2.5-7B-Instruct 约 15GB (下载 10-20 分钟)
+预计运行: 60 步训练 10-20 分钟 + 首次下载
+Mac 替代路线: 无法运行 bitsandbytes, 用第 6 章的 PEFT 流程训练小模型;
+              量化后的模型*推理*在 Mac 上完全可行 (llama.cpp, 见第 12 章)
+```
+
+## 核心概念：4-bit 量化的三个关键词
+
+**NF4（NormalFloat4）**：QLoRA 论文设计的 4-bit 数据类型。朴素 4-bit 是均匀刻度，但神经网络权重的分布近似**正态分布**——中间密、两头稀。NF4 把量化刻度按正态分布的分位数摆放，让每个刻度对应等量的概率质量，信息损失最小。这是"量化格式"的领域知识：同样的 4 bit，NF4 比 INT4 在语言模型上精度明显更好。
+
+**双重量化（Double Quantization）**：分块量化需要为每 64 个权重存一个缩放常数（fp32，占 32/64 = 0.5 bit/参数）。对这批常数再做一次量化，压到 0.127 bit/参数——**对量化常数再量化**，这是 QLoRA 论文的一个精巧小招。
+
+**计算时反量化**：4-bit 只用于**存储**。前向/反向计算时，权重按块反量化回 bf16 参与矩阵乘法。所以训练速度接近 bf16 LoRA，显存却省了 3.5 倍。
+
+QLoRA 的显存账（Qwen2.5-7B，右列为本书实测）：
+
+| 项 | bf16 全参 LoRA | QLoRA (NF4) |
+|---|---|---|
+| 底座权重 | 14.3 GB | 约 4.5 GB |
+| 梯度/优化器 | 只训旁路，约 0.2 GB | 约 0.2 GB |
+| 激活（开启梯度检查点） | 1–3 GB | 约 4 GB |
+| 合计（实测峰值） | 约 16–18 GB | **8.9 GB** |
+
+**梯度检查点（Gradient Checkpointing）**：默认反向传播需要保存所有中间激活值；开启后只存少量检查点，反向时重新计算——**用约 30% 的额外计算时间换大幅显存节省**。显存不够时的第一杠杆。
+
+## 实现路径：QLoRA 代码与全参数流程
+
+### 代码骨架（与第 6 章仅三处不同）
+
+QLoRA 脚本 `ch07_qlora_gpu.py` 的核心就是第 6 章 PEFT 流程加三处改动：
+
+```python
+# 改动 1: 用 4-bit 配置加载底座
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_use_double_quant=True,
+    bnb_4bit_compute_dtype=torch.bfloat16,
+)
+model = AutoModelForCausalLM.from_pretrained(
+    model_name, quantization_config=bnb_config,
+    dtype=torch.bfloat16, device_map={"": 0})
+
+# 改动 2: k-bit 训练准备 (内部处理输入梯度等细节)
+model = prepare_model_for_kbit_training(model)
+
+# 改动 3: 梯度检查点
+model.gradient_checkpointing_enable()
+```
+
+训练循环、掩码损失、保存适配器与第 6 章完全一致。数据集换成更有趣的：**25 条文言文问答**，教 7B 模型"用文言文说话"，并留几道没见过的题检验泛化。LoRA 这次的配置是 r=16、挂满注意力和 FFN 全部 7 类投影层——7B 底座知识丰富，旁路需要承载的是完整的"说话风格"。
+
+### 云 GPU 实操流程（AutoDL 为例）
+
+**租用与开机**：注册 AutoDL → 选"GPU 云主机"→ 地域挑有货的 → GPU 选 RTX 4080/4090（vGPU-32GB 更稳）→ 镜像选**基础镜像 / PyTorch 2.x / CUDA 12.x / Python 3.11+** → 数据盘 50GB 起步 → 开机（约 ¥1.6/小时）。
+
+**SSH 连接与免密**（Mac/Linux）：
+
+```bash
+# 控制台复制登录指令, 形如:
+ssh -p 19449 root@connect.westc.seetacloud.com   # 密码在控制台获取
+
+# 配置免密 (只需一次):
+ssh-copy-id -p 19449 root@connect.westc.seetacloud.com
+```
+
+**装环境**（我方实例实测命令）：
+
+```bash
+pip install -U transformers peft trl datasets accelerate bitsandbytes
+python -c "import torch; print(torch.cuda.is_available())"   # 应为 True
+```
+
+**传文件与训练**：
+
+```bash
+# 上传脚本 (或直接在服务器上创建)
+scp -P 19449 ch07_qlora_gpu.py root@connect.westc.seetacloud.com:/root/
+
+# 在 tmux 中训练 —— 关键! SSH 断开训练不停
+tmux new -s train
+python ch07_qlora_gpu.py
+# Ctrl+B 然后 D 脱离会话; tmux attach -t train 重新接入
+
+# 取回产物
+scp -P 19449 -r root@connect.westc.seetacloud.com:/root/qwen7b_qlora_adapter ./
+```
+
+**用完关机**：AutoDL 按开机时长计费。关机后数据盘保留，下次开机环境还在。**不跑训练时切"无卡模式"开机（约 ¥0.1/小时），可以传文件、改代码**——但注意无卡模式下进程可能被平台限制杀掉，只适合轻量操作。
+
+## 完整例子：7B 模型的真实 QLoRA
+
+在 AutoDL vGPU-32GB（RTX 4080 SUPER 切片）上的真实运行结果：
+
+```text
+trainable params: 40,370,176 || all params: 7,655,986,688 || trainable%: 0.5273
+step  0 | loss 4.3806 | 峰值显存 8.8 GB
+step 10 | loss 1.6658 | 峰值显存 8.9 GB
+step 20 | loss 0.5242 | 峰值显存 8.9 GB
+step 30 | loss 0.0190 | 峰值显存 8.9 GB
+step 40 | loss 0.0030 | 峰值显存 8.9 GB
+step 50 | loss 0.0010 | 峰值显存 8.9 GB
+适配器已保存: qwen7b_qlora_adapter/
+Q: 你是谁
+  A: '吾乃一语言模型，通晓古今文字。'
+Q: 什么是量子计算        # 未参与训练
+  A: '量子计算者，以量子比特为单位，利用叠加与纠缠之律，行并行运算之术也。'
+Q: 给我一句话介绍你自己
+  A: '吾乃一语言模型，通晓古今文字。'
+```
+
+三个值得停下来的观察：
+
+1. **7.7B 参数的模型，峰值显存只有 8.9GB**——4-bit 底座（约 4.5GB）+ LoRA 训练开销 + 梯度检查点下的激活。这意味着一张 12GB 显存的普通游戏本显卡就能微调 7B 模型，QLoRA 的宣传数字在这里得到了实测验证。
+2. **loss 从 4.38 跌到 0.001**：50 步内文言文风格就"挂"上去了——7B 底座本身就精通文言文（预训练里读过大量古文），LoRA 只需教会它"在对话里用"。
+3. **最惊喜的是没见过的题**："什么是量子计算"不在训练数据里，回答却是标准的文言文句式（"……者，……也"）且事实基本正确。**风格/格式行为完美泛化，因为底座早已具备量子计算的知识**——第 5 章"格式靠微调、事实靠预训练"的分界线，在 7B 模型上以最漂亮的方式得到验证。
+
+（本次运行记录：约 12 分钟训练 + 15GB 模型下载，按 ¥1.58/小时计费约 ¥1）
+
+## 边界与取舍
+
+- **QLoRA 有轻微精度代价**：4-bit 底座参与计算的精度低于 bf16，训练 loss 通常略高、最终效果略降（一般 1% 内）。**显存预算够时，优先 bf16 LoRA；显存不够时，QLoRA 是唯一正解。**
+- **4-bit 底座无法直接 merge**：`merge_and_unload()` 要把增量加回原权重，而量化权重不能直接相加。发布时的做法：要么保留"底座 + 适配器"组合发布，要么在一张大显存卡上加载 bf16 底座合并后导出。
+- **bitsandbytes 是 CUDA 专属**：Mac 上无法运行本章主路线。Mac 的正确姿势是"小模型 LoRA 本地训练（第 6 章）+ 量化推理本地跑（第 12 章 llama.cpp）"——训练小、推理大，恰好绕开了 Mac 的两个短板。
+- **别在云上"包月"**：所有实验脚本先在本地小模型上跑通，上 GPU 只做"最终验证"——这也是本书反复使用的开发节奏，能把 GPU 账单压到几块钱。
+- **数据盘 vs 系统盘**：模型缓存、数据集放 `/root/autodl-tmp`（数据盘，可扩容），系统盘只有 30GB，很快会被 15GB 的模型撑爆。
+
+## 本章产物
+
+1. **`ch07_qlora_gpu.py`**：完整 QLoRA 训练脚本（NF4 配置、梯度检查点、文言文数据、显存打印）
+2. **一份云 GPU 实操手册**：租用 → SSH 免密 → 环境 → tmux 训练 → 取回 → 关机，全程按小时计费
+3. **QLoRA 决策规则**：显存够 → bf16 LoRA；不够 → QLoRA；Mac → 训小推大
+
+**概念—操作增量：**
+
+- **Concept 增量**：NF4 的正态分位数量化思想；双重量化；梯度检查点（时间换显存）；QLoRA = 4-bit 底座 + 16-bit 旁路
+- **Operation 增量**：能走通云 GPU 租用全流程（选卡→SSH→传文件→后台训练→取回）；能用 bitsandbytes 加载 4-bit 底座并训练；会做显存估算与检查点开启
+- **Judgment 增量**：显存够用选 bf16 LoRA、不够选 QLoRA；4-bit 底座不能直接 merge；先在本地小模型跑通再上 GPU，账单压到几块钱
+
+## 小结：连接下一章
+
+至此训练三部曲（SFT → LoRA/QLoRA → 对齐）已经完成两部。但回头看看，我们在第 5–7 章用的数据都是"精心手造"的：格式统一、答案干净。真实微调的数据永远没有这么体面——格式混乱、质量参差、大量重复。
+
+下一章转向数据工程：怎么构造指令数据、怎么去重、怎么筛出高质量样本，以及为什么说"微调成败的一半在数据"。

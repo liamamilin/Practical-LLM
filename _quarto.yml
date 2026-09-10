@@ -1,0 +1,56 @@
+project:
+  type: book
+
+book:
+  title: "动手做大模型"
+  subtitle: "从零训练到微调实战"
+  author: "米霖"
+  date: today
+  chapters:
+    - index.qmd
+    - part: "第一部分：原理与从零实现"
+      chapters:
+        - chapter-01-llm-overview.qmd
+        - chapter-02-tokenizer-bpe.qmd
+        - chapter-03-mini-gpt.qmd
+        - chapter-04-pretraining.qmd
+    - part: "第二部分：微调实战"
+      chapters:
+        - chapter-05-sft.qmd
+        - chapter-06-lora-peft.qmd
+        - chapter-07-qlora.qmd
+        - chapter-08-dpo.qmd
+    - part: "第三部分：评估与落地"
+      chapters:
+        - chapter-09-data-engineering.qmd
+        - chapter-10-evaluation.qmd
+        - chapter-11-vlm.qmd
+        - chapter-12-deployment.qmd
+    - references.qmd
+  search: true
+  page-navigation: true
+  reader-mode: true
+
+bibliography: references.bib
+
+format:
+  html:
+    theme:
+      light: cosmo
+      dark: darkly
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-copy: true
+    code-overflow: wrap
+    smooth-scroll: true
+    anchor-sections: true
+    fig-cap-location: bottom
+    tbl-cap-location: top
+  pdf:
+    documentclass: scrreprt
+    toc: true
+    number-sections: true
+    colorlinks: true
+
+editor: visual

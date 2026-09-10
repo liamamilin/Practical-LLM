@@ -1,0 +1,190 @@
+---
+title: "偏好对齐 DPO：让模型学会选更好的答案（Direct Preference Optimization）"
+---
+
+## 本章要解决的问题
+
+SFT 之后，模型会"回答"了。但同一个问题往往有多种回答方式：格式规整的还是随意的、简洁的还是啰嗦的、礼貌的还是生硬的。SFT 只能通过示范教一种写法，**无法表达"这样比那样好"**。
+
+对齐（Alignment）解决的就是这个"好坏排序"问题。工业界的经典方案 RLHF（Reinforcement Learning from Human Feedback）流程复杂：先训练奖励模型，再用 PPO 强化学习微调，训练不稳定、工程门槛高。2023 年出现的 **DPO（Direct Preference Optimization，直接偏好优化）**用一步到位的方式绕开了这两者：只需要（问题，好答案，坏答案）三元组数据，直接在语言模型上做监督训练，效果与 RLHF 相当。
+
+本章先手写 DPO 的核心损失（50 行），再用 TRL 的 `DPOTrainer` 在 0.5B 模型上跑一次完整流程。
+
+## 环境要求
+
+```text
+Python 3.10+
+手写版: pip install torch  (需要 ch03_mini_gpt.py 和 ch05 的 mini_gpt_sft.pt)
+TRL 版: pip install torch transformers peft trl accelerate datasets
+硬件: 均可在 Mac(MPS) 运行; TRL 版建议 16GB 内存
+预计运行: 手写版 ~10 秒; TRL 版 Mac(MPS) 约 3-5 分钟
+```
+
+## 核心概念：从 RLHF 到 DPO
+
+**RLHF 的三步走**（只需理解脉络）：
+
+1. 拿人类偏好数据（同一问题两个回答，人标出哪个好）训练一个**奖励模型（Reward Model）**，它给任何回答打分；
+2. 用 PPO 强化学习微调语言模型，目标 = 奖励模型打的分高；
+3. 训练时加 KL 惩罚，防止模型为了刷分跑飞（偏离原始语言分布）。
+
+**DPO 的洞察**：奖励建模和强化学习可以合并成一步。数学推导（略）证明：最优的奖励模型可以写成策略与参考模型的 logprob 之差，代回 RLHF 目标后得到一个纯监督损失：
+
+$$\mathcal{L} = -\log \sigma\Big(\beta \big[\underbrace{(\log \pi_\theta(y_w|x) - \log \pi_{ref}(y_w|x))}_{\text{好答案的相对提升}} - \underbrace{(\log \pi_\theta(y_l|x) - \log \pi_{ref}(y_l|x))}_{\text{坏答案的相对提升}}\big]\Big)$$
+
+直白版：**拉大"好答案的相对提升"与"坏答案的相对提升"之间的差距**。两个工程含义：
+
+- **参考模型（Reference Model）**：训练起点的一份冻结副本。所有比较都是"相对参考模型的变化"——这就是 RLHF 里 KL 惩罚的化身，防止模型为了偏好信号丢掉语言能力。
+- **β（温度）**：控制约束强度。β 越小，允许策略偏离参考越远（学得快、容易崩）；β 越大越保守。手写实验里你会亲眼看到 β 和学习率失配时模型怎么崩。
+
+**隐式奖励（Implicit Reward）**：训练完的模型其实自带一个打分器——$r(x, y) = \beta \log \frac{\pi_\theta(y|x)}{\pi_{ref}(y|x)}$。评估对齐效果的标准做法就是比较两个候选答案的隐式奖励，而不是只看生成输出。
+
+## 实现路径 A：手写 DPO（mini-GPT）
+
+数据：把第 5 章的 QA 数据改造成**偏好对**——chosen = 正确答案，rejected = 似是而非的错误（别的首都、差 1 的和）。共 131 对，留 4 对模型没见过的做评估。
+
+**序列级 logprob** 是 DPO 的原料（对比第 5 章的 token 级平均）：
+
+```python
+def seq_logprobs(model, x, mask):
+    """每个样本在答案区的 logprob 总和, 返回 shape (B,)"""
+    logits, _ = model(x)
+    lp = F.log_softmax(logits[:, :-1], dim=-1)
+    tok_lp = lp.gather(-1, x[:, 1:].unsqueeze(-1)).squeeze(-1)
+    return (tok_lp * mask[:, 1:].float()).sum(dim=1)
+```
+
+**DPO 损失与训练循环**（策略模型从第 5 章的 SFT 权重出发，参考模型是同一权重的冻结副本）：
+
+```python
+def dpo_loss(pol_pc, pol_pr, ref_pc, ref_pr):
+    chosen_margins = (pol_pc - ref_pc) - (pol_pr - ref_pr)
+    return -F.logsigmoid(BETA * chosen_margins).mean()
+
+for step in range(400):
+    pidx = torch.randperm(x_all.size(0) // 2)[:16]
+    idx = torch.stack([pidx * 2, pidx * 2 + 1], dim=1).flatten()  # 按对采样!
+    xb, mb = x_all[idx], m_all[idx]
+    pol_lp = seq_logprobs(policy, xb, mb)
+    pol_c, pol_r = pol_lp[0::2], pol_lp[1::2]      # 偶=chosen, 奇=rejected
+    with torch.no_grad():
+        ref_lp = seq_logprobs(ref, xb, mb)
+    ref_c, ref_r = ref_lp[0::2], ref_lp[1::2]
+    loss = dpo_loss(pol_c, pol_r, ref_c, ref_r)
+    loss.backward()
+    ...
+```
+
+## 完整例子 A：手写 DPO 的真实运行
+
+脚本 `ch08_dpo_manual.py`（BETA=0.5, lr=3e-5, 400 步），真实输出（Mac / MPS）：
+
+```text
+偏好对: 训练 131 对, 评估 4 对
+训练前 pair accuracy: 50%
+step   0 | dpo loss 0.6931 | 平均边际 +0.000
+step 100 | dpo loss 0.4492 | 平均边际 +1.642
+step 300 | dpo loss 0.2114 | 平均边际 +5.439
+训练后 pair accuracy: 50%
+==================================================
+Q: 法国的首都是哪里
+  [微调后策略模型] 巴黎(-0.22) > 伦敦(-8.56) > 罗马(-16.71)
+  [冻结参考模型] 巴黎(-0.11) > 伦敦(-7.19) > 罗马(-15.52)
+Q: 7+8等于多少
+  [微调后策略模型] 15(-6.87) > 16(-7.45) > 70(-14.68)
+  [冻结参考模型] 15(-2.03) > 16(-2.11) > 70(-16.48)
+```
+
+**怎么读这份输出：**
+
+1. **loss 从 ln(2)=0.693 降下来**：DPO 损失的起点是 0.693（50% 概率），下降意味着 chosen/rejected 的区分度在增大；"平均边际"是 chosen 相对 rejected 的隐式奖励优势，从 0 涨到 +5.4。
+2. **训练对的准确率 78% → 100%**（脚本内打印），模型对"哪个答案更好"的判断在训练对上被拉满。
+3. **测试对（没见过的题）50% → 50%，纹丝不动**——和第 5 章 SFT 的结论呼应：偏好信号教的是"这类答案更好"的判断力，泛化程度取决于模式覆盖，没有魔法。
+4. **生成排序被锐化**：7+8 的候选里，15 和 16 在参考模型下只差 0.08，策略模型拉开到 0.58；巴黎对伦敦的优势从 7.08 扩到 8.34。模型还是那个模型，但"口味"变了。
+
+**这一版实验是踩着两个坑调出来的，两个坑都值得记住：**
+
+- **坑 1：采样打散了配对。** 第一版直接 `randperm` 采 32 行再按偶偶奇奇切分——随机采样后"偶数位"不再对应 chosen，边际在 ±0 附近剧烈震荡，训练无效。修法是**按对采样**（先抽对的编号，再取每对的两行）。凡是成对数据，采样必须保持配对结构。
+- **坑 2：训过头，模型崩坏。** 第二版 lr=5e-4 训 2000 步，边际冲到 +16，loss 不降反升，生成彻底乱掉（7+8 的候选里"70"被排到第一）。全参数 DPO 的隐式奖励没有上限约束，**偏好可以无限放大，代价是语言能力**。最终配置（β=0.5、lr=3e-5、400 步）取得"训练对 100%、排序健康"的平衡。工业界的对应药方：合适的 β + 学习率 + 早期停止 + loss 曲线监控。
+
+## 实现路径 B：TRL DPOTrainer 实战
+
+TRL 把手写的一切封装成一个 Trainer。数据集用 `prompt / chosen / rejected` 三列（对话式格式会自动套 chat template），LoRA 策略 + 底座当参考模型：
+
+```python
+from trl import DPOConfig, DPOTrainer
+
+dpo_args = DPOConfig(
+    output_dir="dpo_out",
+    per_device_train_batch_size=2,
+    gradient_accumulation_steps=4,     # 等效 batch 8
+    max_steps=100,
+    learning_rate=5e-5,
+    beta=0.5,
+    logging_steps=25,
+    report_to="none",
+)
+trainer = DPOTrainer(
+    model=model, ref_model=None,       # PEFT 模式: 参考模型 = 未加 LoRA 的底座
+    args=dpo_args,
+    train_dataset=train_ds,            # prompt / chosen / rejected 三列
+    processing_class=tok,
+    peft_config=LoraConfig(r=8, lora_alpha=16,
+                           target_modules=["q_proj", "k_proj", "v_proj"]),
+)
+trainer.train()
+trainer.save_model("qwen_dpo_adapter")
+```
+
+训练数据：236 对偏好对，教模型**偏好**"【答案】X"的应答格式（chosen），reject 普通陈述句（rejected）。注意措辞——不是"教它输出"，而是"教它觉得哪种好"。
+
+## 完整例子 B：0.5B 模型的真实 DPO
+
+脚本 `ch08_dpo_peft.py`，真实输出（Mac / MPS）：
+
+```text
+偏好对: 236 条 (chosen=【答案】格式, rejected=普通格式)
+{'loss': '0.1042', ..., 'rewards/accuracies': '0.97', 'rewards/margins': '4.623', ...}
+{'loss': '0.00041', ..., 'rewards/accuracies': '1', 'rewards/margins': '8.573', ...}
+{'loss': '0.000198', ..., 'rewards/margins': '9.213', ...}
+{'train_runtime': '128.6', 'train_loss': '0.02624', ...}
+DPO 适配器已保存: qwen_dpo_adapter/
+====================================================
+没见过的题上的隐式奖励边际 (正 = 偏好【答案】格式):
+  Q: 埃及的首都是哪里       边际 = +8.11
+  Q: 印度的首都是哪里       边际 = +5.62
+  Q: 17+25等于多少      边际 = +11.40
+  Q: 1+1等于多少        边际 = +7.47
+```
+
+**关键发现：格式偏好泛化到了没见过的题上**。埃及、印度、17+25、1+1 都不在训练集里，但 DPO 后隐式奖励全部强烈倒向"【答案】"格式（+5.6 ~ +11.4）。这正是对齐的价值所在：**它改变的是"什么是好回答"的判断标准，这个标准天然可泛化**——与事实记忆（第 5 章的结论）形成鲜明对照。
+
+**一个必须诚实交代的实验细节**：用贪心解码直接检查生成结果，你会发现输出**未必**变成"【答案】"格式。DPO 优化的是候选之间的**偏好排序**，不是贪心路径；工业实践中 DPO 之后的标准评估就是采样 + 计算 win rate（赢率），而不是看单次贪心输出。这也是为什么评估方法（第 10 章）和对齐方法必须配套设计。
+
+**另一个实战教训**：不要直接用 trainer 内存里的模型做训练后生成——训练后的配置状态不可靠，我们最初这样做时输出全是乱码，而把适配器保存后加载到全新底座上生成完全正常。**"保存适配器 → 新底座加载"是发布对齐模型的标准流程。**
+
+## 边界与取舍
+
+- **DPO vs RLHF/PPO**：DPO 简单稳定、单卡可训、数据就是偏好对，是开源社区的事实标准。PPO 在大规模奖励模型 + 复杂奖励信号场景仍有优势，但工程成本高一个数量级。学习阶段和中小规模微调，DPO 几乎总是正确选择。
+- **偏好数据从哪来**：人工标注（贵）、强模型生成 + 弱模型筛选（AI 反馈，廉价）、用户反馈。构造质量决定上限——"好答案"与"坏答案"必须只差你想要改变的维度，否则模型学到错误的判断标准。
+- **常见失败模式**（两个手写坑的通用化）：①配对数据结构被破坏；②训练过度导致语言能力退化（生成质量骤降、出现重复/乱码）——监控手段是同时看 DPO 指标和生成样例。
+- **DPO 之后还能再 SFT 吗**：可以但不常见。常规顺序是 SFT → DPO（可多轮），每轮换一批偏好数据。
+
+## 本章产物
+
+1. **`ch08_dpo_manual.py`**：DPO 损失的手写实现（序列 logprob、按对采样、隐式奖励边际、参考模型）
+2. **`ch08_dpo_peft.py`**：TRL `DPOTrainer` 标准工作流 + 保存/加载 + 边际评估
+3. **`qwen_dpo_adapter/`**：0.5B 模型的 DPO 适配器
+4. **三条对齐判断力**：①DPO 教判断标准，标准可泛化；②偏好排序 ≠ 贪心输出，评估要用 win rate；③β/学习率/步数失配会毁掉语言能力，监控生成样例是底线
+
+**概念—操作增量：**
+
+- **Concept 增量**：RLHF 三步脉络与 DPO 的合并洞察；隐式奖励（策略-参考 logprob 差）；β 与参考模型的约束作用；win rate 评估范式
+- **Operation 增量**：能构造偏好对数据；能手写 DPO 损失（按对采样 + 序列 logprob）；能用 TRL DPOTrainer 训练并计算隐式奖励边际
+- **Judgment 增量**：偏好信号教判断标准（可泛化）而非事实；偏好排序 ≠ 贪心输出，评估要用 win rate；β/学习率失配会毁掉语言能力，监控生成样例是底线
+
+## 小结：连接下一章
+
+训练三部曲到此收官：SFT 教会听话，LoRA/QLoRA 解决算力，DPO 教会品味。但回头看，这三章的数据都是精心手造的：格式统一、答案干净、规模精挑。真实微调的第一杀手不是训练技术，而是**数据**。
+
+下一章转向数据工程：指令数据从哪来、怎么去重、怎么清洗、怎么用 LLM 合成数据——以及为什么说"微调成败的一半在数据"。
